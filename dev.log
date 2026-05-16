@@ -1,0 +1,12 @@
+
+> transcript-analysis@0.1.0 dev
+> next dev
+
+▲ Next.js 16.2.6 (Turbopack)
+- Local:         http://localhost:3000
+- Network:       http://10.0.0.15:3000
+- Environments: .env.local
+✓ Ready in 991ms
+
+ GET / 200 in 3.3s (next.js: 3.0s, application-code: 272ms)
+[?25h
