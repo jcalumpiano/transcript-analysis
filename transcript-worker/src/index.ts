@@ -1,5 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
-import { verifySignature } from '@upstash/qstash/nextjs';
+import { Receiver } from '@upstash/qstash';
+import { z } from 'zod';
+
 import { Database } from '../lib/database.types';
 
 interface TranscriptProcessingJob {
@@ -19,14 +21,17 @@ export default {
       // Read body once and reuse it
       const bodyText = await request.text();
 
-      // Verify QStash signature for security
-      const isValid = await verifySignature({
-        signature: request.headers.get('upstash-signature') || '',
-        body: bodyText,
-        secret: env.QSTASH_CURRENT_SIGNING_KEY,
+      const receiver = new Receiver({
+        currentSigningKey: env.QSTASH_CURRENT_SIGNING_KEY,
+        nextSigningKey: env.QSTASH_NEXT_SIGNING_KEY,
       });
 
-      if (!isValid) {
+      try {
+        await receiver.verify({
+          signature: request.headers.get('upstash-signature') ?? '',
+          body: bodyText,
+        });
+      } catch {
         return new Response('Unauthorized: Invalid signature', { status: 401 });
       }
 
@@ -48,7 +53,7 @@ export default {
       );
 
       // Process transcript
-      const processingResults = await processTranscript(content);
+      const processingResults = await processTranscript(env, content);
 
       // Save results to Supabase
       await saveResultsToSupabase(
@@ -67,13 +72,16 @@ export default {
       );
     } catch (error) {
       console.error('Worker error:', error);
-
-      // Try to update the notes record with error status
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const errorStack = error instanceof Error ? error.stack : '';
+
+      console.error('Full error:', { message: errorMessage, stack: errorStack });
+
       return new Response(
         JSON.stringify({
           success: false,
           error: errorMessage,
+          details: errorStack,
         }),
         { status: 500 }
       );
@@ -82,20 +90,18 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 // Process the transcript and extract notes, action items, and decisions
-async function processTranscript(content: string): Promise<ProcessingResults> {
-  const cleanedNotes = cleanTranscript(content);
-  const actionItems = extractActionItems(content);
-  const decisions = extractDecisions(content);
+async function processTranscript(env: Env, content: string): Promise<ProcessingResults> {
+  const [cleanedNotes, actionItems, decisions] = await Promise.all([
+    cleanTranscript(env.AI, content),
+    extractActionItems(env.AI, content),
+    extractDecisions(env.AI, content),
+  ]);
 
-  return {
-    cleanedNotes,
-    actionItems,
-    decisions,
-  };
+  return { cleanedNotes, actionItems, decisions };
 }
 
 // Remove filler words and clean up transcript
-function cleanTranscript(content: string): string {
+async function cleanTranscript(ai: Ai, content: string): Promise<string> {
   const fillerWords = [
     '\\bum\\b', '\\buh\\b', '\\blike\\b', '\\byou know\\b',
     '\\bbasically\\b', '\\bactually\\b', '\\bkind of\\b', '\\bsort of\\b',
@@ -116,123 +122,110 @@ function cleanTranscript(content: string): string {
     .replace(/\n{2,}/g, '\n')
     .trim();
 
-  return cleaned;
+  const response = await ai.run('@cf/meta/llama-3.1-8b-instruct', {
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You are a meeting notes assistant. Summarize the key points from the transcript into 3–7 concise bullet points. Output only the bullet points, no preamble.',
+      },
+      {
+        role: 'user',
+        content: `Transcript:\n${cleaned}`,
+      },
+    ],
+  });
+
+  return (response as { response: string }).response.trim();
 }
+
+const ActionItemSchema = z.object({
+  action_items: z.array(
+    z.object({
+      description: z.string(),
+      owner: z.string().nullable(),
+      due_date: z.string().nullable(),
+    })
+  ),
+});
 
 // Extract action items from transcript
-function extractActionItems(content: string): ActionItem[] {
-  const actionItems: ActionItem[] = [];
-
-  // Patterns for action items:
-  // "John will do X by Friday"
-  // "Sarah: I'll handle X"
-  // "Mike needs to X"
-  const patterns = [
-    /(\w+)\s+will\s+(.+?)(?:by|until|before)\s+(.+?)(?:\.|,|$)/gi,
-    /(\w+):\s+(?:I'll|I will|I'm going to)\s+(.+?)(?:\.|,|$)/gi,
-    /(\w+)\s+(?:needs to|should|must)\s+(.+?)(?:by|until)?\s+(.+?)(?:\.|,|$)/gi,
-  ];
-
-  patterns.forEach(pattern => {
-    let match;
-    while ((match = pattern.exec(content)) !== null) {
-      const owner = match[1];
-      const description = match[2]?.trim() || match[2];
-      const dueDate = match[3]?.trim() || null;
-
-      if (description && description.length > 3) {
-        actionItems.push({
-          description: description.toLowerCase(),
-          owner: owner.toLowerCase(),
-          due_date: parseDueDate(dueDate),
-        });
-      }
-    }
+async function extractActionItems(ai: Ai, content: string): Promise<ActionItem[]> {
+  const response = await ai.run('@cf/meta/llama-3.1-8b-instruct', {
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You extract action items from meeting transcripts. Output ONLY valid JSON with no extra text. Format: {"action_items":[{"description":"task description","owner":"person name or null","due_date":"YYYY-MM-DD or null"}]}',
+      },
+      {
+        role: 'user',
+        content: `Extract all action items from this transcript:\n${content}`,
+      },
+    ],
   });
 
-  // Remove duplicates
-  return Array.from(new Map(
-    actionItems.map(item => [item.description, item])
-  ).values());
+  const raw = (response as { response: string }).response.trim();
+
+  try {
+    const jsonStart = raw.indexOf('{');
+    const jsonEnd = raw.lastIndexOf('}') + 1;
+    const parsed = JSON.parse(raw.slice(jsonStart, jsonEnd));
+    const validated = ActionItemSchema.parse(parsed);
+    return validated.action_items.map(item => ({
+      ...item,
+      due_date: isValidISODate(item.due_date) ? item.due_date : null,
+    }));
+  } catch {
+    return [];
+  }
 }
+
+function isValidISODate(date: string | null):
+boolean {
+  if (!date) return false;
+  const iso8601Regex = /^\d{4}-\d{2}-\d{2}$/;
+  if (!iso8601Regex.test(date)) return false;
+  const parsed = new Date(date + 'T00:00:00Z');
+  return !isNaN(parsed.getTime());
+}
+
+const DecisionSchema = z.object({
+  decisions: z.array(
+    z.object({
+      decision_text: z.string(),
+      rationale: z.string().nullable(),
+    })
+  ),
+});
 
 // Extract decisions from transcript
-function extractDecisions(content: string): Decision[] {
-  const decisions: Decision[] = [];
-
-  // Patterns for decisions:
-  // "We decided to X"
-  // "We're going with X"
-  // "The decision is X"
-  // "We'll use X"
-  const patterns = [
-    /(?:we\s+)?(?:decided|decided on|will go with|chose|selected|agreed on)\s+(.+?)(?:\.|,|and|so)/gi,
-    /(?:the\s+)?decision\s+(?:is|was)\s+(.+?)(?:\.|,|$)/gi,
-    /(?:we\s+)?(?:will use|will implement|will adopt)\s+(.+?)(?:\.|,|$)/gi,
-  ];
-
-  patterns.forEach(pattern => {
-    let match;
-    while ((match = pattern.exec(content)) !== null) {
-      const decisionText = match[1]?.trim();
-
-      if (decisionText && decisionText.length > 5) {
-        decisions.push({
-          decision_text: decisionText.toLowerCase(),
-          rationale: null,
-        });
-      }
-    }
+async function extractDecisions(ai: Ai, content: string): Promise<Decision[]> {
+  const response = await ai.run('@cf/meta/llama-3.1-8b-instruct', {
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You extract key decisions from meeting transcripts. Output ONLY valid JSON with no extra text. Format: {"decisions":[{"decision_text":"what was decided","rationale":"why or null"}]}',
+      },
+      {
+        role: 'user',
+        content: `Extract all key decisions from this transcript:\n${content}`,
+      },
+    ],
   });
 
-  // Remove duplicates
-  return Array.from(new Map(
-    decisions.map(decision => [decision.decision_text, decision])
-  ).values());
-}
+  const raw = (response as { response: string }).response.trim();
 
-// Parse due dates from text (e.g., "Friday", "next week", "3 days")
-function parseDueDate(dateStr: string | null): string | null {
-  if (!dateStr) return null;
-
-  const now = new Date();
-  const dateStr_lower = dateStr.toLowerCase();
-
-  // Map days to offsets
-  const daysOfWeek: { [key: string]: number } = {
-    monday: 1,
-    tuesday: 2,
-    wednesday: 3,
-    thursday: 4,
-    friday: 5,
-    saturday: 6,
-    sunday: 0,
-  };
-
-  // Check for day of week
-  for (const [day, offset] of Object.entries(daysOfWeek)) {
-    if (dateStr_lower.includes(day)) {
-      const daysAhead = offset - now.getDay();
-      const dueDate = new Date(now.setDate(now.getDate() + (daysAhead > 0 ? daysAhead : 7)));
-      return dueDate.toISOString().split('T')[0];
-    }
+  try {
+    const jsonStart = raw.indexOf('{');
+    const jsonEnd = raw.lastIndexOf('}') + 1;
+    const parsed = JSON.parse(raw.slice(jsonStart, jsonEnd));
+    const validated = DecisionSchema.parse(parsed);
+    return validated.decisions;
+  } catch {
+    return [];
   }
-
-  // Check for "next week" or "week"
-  if (dateStr_lower.includes('week')) {
-    const dueDate = new Date(now.setDate(now.getDate() + 7));
-    return dueDate.toISOString().split('T')[0];
-  }
-
-  // Check for number of days
-  const daysMatch = dateStr.match(/(\d+)\s+days?/i);
-  if (daysMatch) {
-    const days = parseInt(daysMatch[1]);
-    const dueDate = new Date(now.setDate(now.getDate() + days));
-    return dueDate.toISOString().split('T')[0];
-  }
-
-  return null;
 }
 
 // Save processing results to Supabase
@@ -241,17 +234,26 @@ async function saveResultsToSupabase(
   transcriptId: string,
   results: ProcessingResults
 ): Promise<void> {
+  console.log(`Updating notes for transcriptId: ${transcriptId}`);
+  const updatePayload = {
+    cleaned_notes: results.cleanedNotes,
+    status: 'completed',
+    updated_at: new Date().toISOString(),
+  };
+  console.log(`Update payload:`, JSON.stringify(updatePayload));
+
   // Update notes record with cleaned transcript
-  const { error: notesError } = await supabase
+  const { error: notesError, data: updateData } = await supabase
     .from('notes')
-    .update({
-      cleaned_notes: results.cleanedNotes,
-      status: 'completed',
-      updated_at: new Date().toISOString(),
-    })
+    .update(updatePayload)
     .eq('transcript_id', transcriptId);
 
-  if (notesError) throw new Error(`Failed to update notes: ${notesError.message}`);
+  console.log(`Update response - error: ${notesError ? 'yes' : 'no'}, data:`, updateData);
+
+  if (notesError) {
+    console.error(`Supabase error updating notes:`, notesError);
+    throw new Error(`Failed to update notes: ${notesError.message}`);
+  }
 
   // Insert action items
   if (results.actionItems.length > 0) {
@@ -291,6 +293,7 @@ async function saveResultsToSupabase(
 
 // Types
 interface Env {
+  AI: Ai;
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
   QSTASH_CURRENT_SIGNING_KEY: string;
@@ -300,7 +303,7 @@ interface Env {
 
 interface ActionItem {
   description: string;
-  owner: string;
+  owner: string | null;
   due_date: string | null;
 }
 
