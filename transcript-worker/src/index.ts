@@ -1,7 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import { Receiver } from '@upstash/qstash';
-import { z } from 'zod';
-
+import { url, z } from 'zod';
+import { DurableObject } from 'cloudflare:workers';
 import { Database } from '../lib/database.types';
 
 interface TranscriptProcessingJob {
@@ -10,9 +10,22 @@ interface TranscriptProcessingJob {
   title: string;
 }
 
+function getStateStub(env: Env, transcriptId: string) {
+  const id = env.TRANSCRIPT_STATE.idFromName(transcriptId);
+  return env.TRANSCRIPT_STATE.get(id);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // Only accept POST requests
+    const url = new URL(request.url);
+    // New: status polling endpoint for the frontend
+    if (request.method === 'GET' && url.pathname.startsWith('/status/')) {
+      const transcriptId = url.pathname.replace('/status/', '');
+      if (!transcriptId) return new Response('Missing transcript ID', { status: 400 });
+      const stub = getStateStub(env, transcriptId);
+      return stub.fetch(new Request('https://internal/state'));
+    }
+
     if (request.method !== 'POST') {
       return new Response('Method not allowed', { status: 405 });
     }
@@ -46,30 +59,62 @@ export default {
         );
       }
 
+      // Mark as processing
+      const stub = getStateStub(env, transcriptId);
+      await stub.fetch(new Request('https://internal/state', {
+        method: 'PUT',
+        body: JSON.stringify({ status: 'processing' }),
+      }));
+
       // Initialize Supabase client
       const supabase = createClient<Database>(
         env.SUPABASE_URL,
         env.SUPABASE_SERVICE_ROLE_KEY
       );
 
-      // Process transcript
-      const processingResults = await processTranscript(env, content);
+      try {
+        const processingResults = await processTranscript(env, content);
+        await saveResultsToSupabase(supabase, transcriptId, processingResults);
 
-      // Save results to Supabase
-      await saveResultsToSupabase(
-        supabase,
-        transcriptId,
-        processingResults
-      );
+        // Mark as complete
+        await stub.fetch(new Request('https://internal/state', {
+          method: 'PUT',
+          body: JSON.stringify({ status: 'complete' }),
+        }));
 
-      return new Response(
-        JSON.stringify({
-          success: true,
-          transcriptId,
-          results: processingResults,
-        }),
-        { status: 200 }
-      );
+        return Response.json({ success: true, transcriptId, results: processingResults });
+      } catch (processingError) {
+        const errorMessage = processingError instanceof Error
+          ? processingError.message
+          : 'Unknown error';
+
+        // Mark as error
+        await stub.fetch(new Request('https://internal/state', {
+          method: 'PUT',
+          body: JSON.stringify({ status: 'error', error: errorMessage }),
+        }));
+
+        throw processingError;
+      }
+
+      // // Process transcript
+      // const processingResults = await processTranscript(env, content);
+
+      // // Save results to Supabase
+      // await saveResultsToSupabase(
+      //   supabase,
+      //   transcriptId,
+      //   processingResults
+      // );
+
+      // return new Response(
+      //   JSON.stringify({
+      //     success: true,
+      //     transcriptId,
+      //     results: processingResults,
+      //   }),
+      //   { status: 200 }
+      // );
     } catch (error) {
       console.error('Worker error:', error);
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -136,7 +181,9 @@ async function cleanTranscript(ai: Ai, content: string): Promise<string> {
     ],
   });
 
-  return (response as { response: string }).response.trim();
+  const result = (response as { response: string }).response?.trim();
+  if (!result) throw new Error('AI returned empty response for cleanTranscript');
+  return result;
 }
 
 const ActionItemSchema = z.object({
@@ -206,7 +253,7 @@ async function extractDecisions(ai: Ai, content: string): Promise<Decision[]> {
       {
         role: 'system',
         content:
-          'You extract key decisions from meeting transcripts. Output ONLY valid JSON with no extra text. Format: {"decisions":[{"decision_text":"what was decided","rationale":"why or null"}]}',
+          'You extract key decisions from meeting transcripts. Output ONLY valid JSON with no extra text. For rationale, infer the reason from context even if not explicitly stated — only use null if there is absolutely no contextual clue. Format: {"decisions":[{"decision_text":"what was decided","rationale":"why it was decided or context behind it"}]}',
       },
       {
         role: 'user',
@@ -243,16 +290,21 @@ async function saveResultsToSupabase(
   console.log(`Update payload:`, JSON.stringify(updatePayload));
 
   // Update notes record with cleaned transcript
-  const { error: notesError, data: updateData } = await supabase
+  const { error: notesError, count } = await supabase
     .from('notes')
     .update(updatePayload)
-    .eq('transcript_id', transcriptId);
+    .eq('transcript_id', transcriptId)
+    .select('id', { count: 'exact', head: true });
 
-  console.log(`Update response - error: ${notesError ? 'yes' : 'no'}, data:`, updateData);
+  console.log(`Update response - error: ${notesError ? notesError.message : 'none'}, rows matched: ${count}`);
 
   if (notesError) {
     console.error(`Supabase error updating notes:`, notesError);
     throw new Error(`Failed to update notes: ${notesError.message}`);
+  }
+
+  if (count === 0) {
+    throw new Error(`No notes row found for transcript_id=${transcriptId} — cleaned_notes not saved`);
   }
 
   // Insert action items
@@ -291,6 +343,34 @@ async function saveResultsToSupabase(
   }
 }
 
+export class TranscriptState extends DurableObject<Env> {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (request.method === 'GET' && url.pathname === '/state') {
+      const status = (await this.ctx.storage.get<string>('status')) ?? 'pending';
+      const error = (await this.ctx.storage.get<string>('error')) ?? null;
+      const updatedAt = (await this.ctx.storage.get<string>('updatedAt')) ?? null;
+      console.log(`[TranscriptState] GET /state → status=${status}`);
+      return Response.json({ status, error, updatedAt });
+    }
+
+    if (request.method === 'PUT' && url.pathname === '/state') {
+      const { status, error } = await request.json<{ status: string; error?: string }>();
+      console.log(`[TranscriptState] PUT /state → status=${status}${error ? ` error=${error}` : ''}`);
+      await this.ctx.storage.put('status', status);
+      await this.ctx.storage.put('updatedAt', new Date().toISOString());
+      if (error) {
+        await this.ctx.storage.put('error', error);
+      }
+      return new Response('ok');
+    }
+
+    return new Response('not found', { status: 404 });
+  }
+}
+
+
 // Types
 interface Env {
   AI: Ai;
@@ -299,6 +379,7 @@ interface Env {
   QSTASH_CURRENT_SIGNING_KEY: string;
   QSTASH_NEXT_SIGNING_KEY: string;
   ENVIRONMENT: string;
+  TRANSCRIPT_STATE: DurableObjectNamespace<TranscriptState>;
 }
 
 interface ActionItem {
