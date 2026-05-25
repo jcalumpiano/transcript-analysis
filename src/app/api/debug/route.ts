@@ -4,7 +4,7 @@ import { supabase } from "@/lib/supabase";
 export async function GET() {
   try {
     // Test 1: Check Supabase connection
-    const { data: tables, error: tablesError } = await supabase
+    const { data: _tables, error: tablesError } = await supabase
       .from("transcripts")
       .select("*")
       .limit(1);
